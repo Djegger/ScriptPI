@@ -1,9 +1,17 @@
 /****************************************************************************
  * neighborshow.c
  *
- * Exemple :  ./neighborshow
- *            ./neighborshow -hop 2
+ * Usage:
+ *   gcc -o neighborshow neighborshow.c
+ *   ./neighborshow
+ *   ./neighborshow -hop 2
+ *
+ * Envoie une requête de découverte en broadcast et écoute les réponses.
+ * Le paramètre -hop n est passé à l'agent (neighboragent).
  ****************************************************************************/
+
+#define _DEFAULT_SOURCE
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -15,7 +23,7 @@
 #include <stdbool.h>
 #include <sys/select.h>
 
-/* On réutilise la même structure que dans neighboragent */
+/* Même structure que dans neighboragent */
 typedef struct {
     unsigned int request_id;
     int hops;
@@ -32,7 +40,7 @@ unsigned int generate_request_id() {
 }
 
 int main(int argc, char *argv[]) {
-    int hops = 1; // par défaut, un seul saut
+    int hops = 1; // Valeur par défaut
     if (argc == 3 && strcmp(argv[1], "-hop") == 0) {
         hops = atoi(argv[2]);
         if (hops < 1) {
@@ -45,14 +53,14 @@ int main(int argc, char *argv[]) {
         exit(EXIT_FAILURE);
     }
 
-    /* Création d’un socket UDP */
+    /* Création du socket UDP */
     int sockfd;
     if ((sockfd = socket(AF_INET, SOCK_DGRAM, 0)) < 0) {
         perror("socket");
         exit(EXIT_FAILURE);
     }
 
-    /* Activation du broadcast sur le socket */
+    /* Autoriser le broadcast sur ce socket */
     int broadcast_enable = 1;
     if (setsockopt(sockfd, SOL_SOCKET, SO_BROADCAST,
                    &broadcast_enable, sizeof(broadcast_enable)) < 0) {
@@ -61,7 +69,7 @@ int main(int argc, char *argv[]) {
         exit(EXIT_FAILURE);
     }
 
-    /* Préparation de l'adresse de broadcast local */
+    /* Adresse de broadcast local (255.255.255.255) */
     struct sockaddr_in broadcast_addr;
     memset(&broadcast_addr, 0, sizeof(broadcast_addr));
     broadcast_addr.sin_family      = AF_INET;
@@ -70,10 +78,10 @@ int main(int argc, char *argv[]) {
 
     /* Préparation de la requête */
     discovery_request_t req;
-    req.request_id = generate_request_id();  // identifiant pseudo-unique
+    req.request_id = generate_request_id();
     req.hops       = hops;
 
-    /* Envoi de la requête en broadcast */
+    /* Envoi de la requête */
     if (sendto(sockfd, &req, sizeof(req), 0,
                (struct sockaddr*)&broadcast_addr, sizeof(broadcast_addr)) < 0) {
         perror("sendto");
@@ -81,9 +89,9 @@ int main(int argc, char *argv[]) {
         exit(EXIT_FAILURE);
     }
 
-    printf("neighborshow: requête envoyée (hops = %d). Attente des réponses...\n", hops);
+    printf("neighborshow: requête envoyée (hops=%d). Attente des réponses...\n", hops);
 
-    /* Récupération des réponses (noms d’hôte), sans doublons */
+    /* Récupération des réponses (noms d’hôte), en évitant les doublons */
     #define MAX_HOSTS 100
     char hosts[MAX_HOSTS][MAX_BUF];
     int  host_count = 0;
@@ -91,13 +99,10 @@ int main(int argc, char *argv[]) {
     time_t start_time = time(NULL);
 
     while (1) {
-        time_t now = time(NULL);
-        if (difftime(now, start_time) > RESPONSE_WAIT_TIME) {
-            // On arrête d’écouter après RESPONSE_WAIT_TIME secondes
-            break;
+        if (time(NULL) - start_time > RESPONSE_WAIT_TIME) {
+            break;  // On arrête après RESPONSE_WAIT_TIME secondes
         }
 
-        /* On utilise select() pour ne pas bloquer plus d’une seconde */
         fd_set read_fds;
         FD_ZERO(&read_fds);
         FD_SET(sockfd, &read_fds);
@@ -112,7 +117,7 @@ int main(int argc, char *argv[]) {
             break;
         }
         else if (retval == 0) {
-            // pas de donnée reçue, on refait un tour
+            // Rien reçu pendant 1 seconde, on reteste
             continue;
         }
         else {
@@ -125,7 +130,6 @@ int main(int argc, char *argv[]) {
                 int len = recvfrom(sockfd, buf, sizeof(buf), 0,
                                    (struct sockaddr*)&src_addr, &src_len);
                 if (len > 0) {
-                    // On a reçu un nom d’hôte
                     bool found = false;
                     for (int i = 0; i < host_count; i++) {
                         if (strncmp(hosts[i], buf, MAX_BUF) == 0) {
@@ -144,8 +148,8 @@ int main(int argc, char *argv[]) {
 
     close(sockfd);
 
-    /* Affichage du résultat */
-    printf("neighborshow: liste des machines trouvées (hops=%d):\n", hops);
+    /* Affichage */
+    printf("neighborshow: machines découvertes (hops=%d):\n", hops);
     for (int i = 0; i < host_count; i++) {
         printf(" - %s\n", hosts[i]);
     }
