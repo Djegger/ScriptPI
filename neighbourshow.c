@@ -1,177 +1,184 @@
-/****************************************************************************
+/****************************************************
  * neighborshow.c
  *
- * Programme client qui diffuse une requête de découverte sur le réseau
- * et attend les réponses des agents (neighboragent) pour afficher la
- * liste des noms de machines voisines. Par défaut, n=1 saut; si on
- * utilise "-hop n", on peut augmenter la portée des sauts.
+ * Compilation :
+ *    gcc neighborshow.c -o neighborshow
  *
- * Compilation:
- *   gcc -o neighborshow neighborshow.c
+ * Exécution (exemples) :
+ *    ./neighborshow
+ *    ./neighborshow -hop 1
+ *    ./neighborshow -hop 2
  *
- * Exécution:
- *   ./neighborshow
- *   ./neighborshow -hop 2
- ****************************************************************************/
+ * Explications :
+ *  - Envoie un broadcast sur 255.255.255.255:9999
+ *  - Message du type "NEIGHBOR_DISCOVERY message_id=XXX hop=N origin=YYY"
+ *  - Attend 2s de réponses
+ *  - Stocke et affiche les hostnames reçus
+ ****************************************************/
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 #include <arpa/inet.h>
-#include <sys/socket.h>
 #include <netinet/in.h>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <netdb.h>
 #include <time.h>
-#include <stdbool.h>
-#include <sys/select.h>
 
-/* On réutilise la même structure que dans neighboragent */
-typedef struct {
-    unsigned int request_id;
-    int hops;
-} discovery_request_t;
+#define AGENT_PORT 9999
+#define BUFFER_SIZE 1024
 
-/* Même port que l'agent */
-#define DISCOVERY_PORT 9999
+static void usage(const char *prog) {
+    fprintf(stderr, "Usage: %s [-hop n]\n", prog);
+    exit(EXIT_FAILURE);
+}
 
-/* Durée d'écoute des réponses (en secondes) */
-#define RESPONSE_WAIT_TIME 3
-
-/* Taille max des buffers */
-#define MAX_BUF 1024
-
-/* Fonction utilitaire pour générer un ID de requête pseudo-aléatoire */
-unsigned int generate_request_id() {
-    srand(time(NULL) ^ getpid());
-    return rand();
+// Récupération du hostname local pour 'origin'
+static void get_local_hostname(char *buf, size_t buflen) {
+    if (gethostname(buf, buflen) != 0) {
+        perror("gethostname");
+        strncpy(buf, "UnknownHost", buflen);
+        buf[buflen-1] = '\0';
+    }
 }
 
 int main(int argc, char *argv[]) {
-    int hops = 1; // par défaut, un seul saut
-    if (argc == 3 && strcmp(argv[1], "-hop") == 0) {
-        hops = atoi(argv[2]);
-        if (hops < 1) {
-            fprintf(stderr, "Nombre de sauts invalide, utilisation de 1 par défaut.\n");
-            hops = 1;
+    int hop = 1; // par défaut
+    // Lecture des arguments
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "-hop") == 0) {
+            if (i+1 < argc) {
+                hop = atoi(argv[++i]);
+                if (hop < 1) {
+                    fprintf(stderr, "Valeur de hop invalide.\n");
+                    return 1;
+                }
+            } else {
+                usage(argv[0]);
+            }
+        } else {
+            usage(argv[0]);
         }
     }
-    else if (argc != 1) {
-        fprintf(stderr, "Usage : %s [-hop n]\n", argv[0]);
-        exit(EXIT_FAILURE);
-    }
 
-    /* Création d’un socket UDP */
-    int sockfd;
-    if ((sockfd = socket(AF_INET, SOCK_DGRAM, 0)) < 0) {
+    // Création du socket pour l'envoi et la réception
+    int sockfd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sockfd < 0) {
         perror("socket");
-        exit(EXIT_FAILURE);
+        return 1;
     }
 
-    /* On prépare l'adresse de broadcast */
-    struct sockaddr_in broadcast_addr;
-    memset(&broadcast_addr, 0, sizeof(broadcast_addr));
-    broadcast_addr.sin_family = AF_INET;
-    broadcast_addr.sin_port = htons(DISCOVERY_PORT);
-    broadcast_addr.sin_addr.s_addr = htonl(INADDR_BROADCAST);
-
-    /* On active le broadcast sur notre socket */
-    int broadcast_enable = 1;
+    // Autoriser le broadcast
+    int broadcastEnable = 1;
     if (setsockopt(sockfd, SOL_SOCKET, SO_BROADCAST,
-                   &broadcast_enable, sizeof(broadcast_enable)) < 0) {
-        perror("setsockopt - SO_BROADCAST");
+                   &broadcastEnable, sizeof(broadcastEnable)) < 0) {
+        perror("setsockopt(SO_BROADCAST)");
         close(sockfd);
-        exit(EXIT_FAILURE);
+        return 1;
     }
 
-    /* Préparation de la requête */
-    discovery_request_t req;
-    req.request_id = generate_request_id();  // identifiant unique
-    req.hops = hops;
+    // Lier le socket à un port local (optionnel, pour recevoir les réponses)
+    struct sockaddr_in local_addr;
+    memset(&local_addr, 0, sizeof(local_addr));
+    local_addr.sin_family      = AF_INET;
+    local_addr.sin_addr.s_addr = INADDR_ANY;
+    local_addr.sin_port        = 0; // port aléatoire
+    if (bind(sockfd, (struct sockaddr*)&local_addr, sizeof(local_addr)) < 0) {
+        perror("bind");
+        close(sockfd);
+        return 1;
+    }
 
-    /* Envoi de la requête en broadcast */
-    if (sendto(sockfd, &req, sizeof(req), 0,
-               (struct sockaddr*)&broadcast_addr, sizeof(broadcast_addr)) < 0) {
+    // Mettre un timeout de 2 secondes pour la réception
+    struct timeval tv;
+    tv.tv_sec  = 2;
+    tv.tv_usec = 0;
+    if (setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO,
+                   &tv, sizeof(tv)) < 0) {
+        perror("setsockopt(SO_RCVTIMEO)");
+        close(sockfd);
+        return 1;
+    }
+
+    // Préparer l'adresse de broadcast (LAN local)
+    struct sockaddr_in bcast_addr;
+    memset(&bcast_addr, 0, sizeof(bcast_addr));
+    bcast_addr.sin_family      = AF_INET;
+    bcast_addr.sin_port        = htons(AGENT_PORT);
+    bcast_addr.sin_addr.s_addr = inet_addr("255.255.255.255");
+
+    // Générer un message_id aléatoire
+    srand(time(NULL));
+    int message_id = rand() % 100000; // pas ultra unique, mais suffisant pour démo
+
+    // Récupérer le hostname local
+    char myhostname[256];
+    get_local_hostname(myhostname, sizeof(myhostname));
+
+    // Construire la requête
+    // Format : "NEIGHBOR_DISCOVERY message_id=1234 hop=2 origin=MonHost"
+    char request[BUFFER_SIZE];
+    snprintf(request, sizeof(request),
+             "NEIGHBOR_DISCOVERY message_id=%d hop=%d origin=%s",
+             message_id, hop, myhostname);
+
+    // Envoi broadcast
+    ssize_t sent = sendto(sockfd, request, strlen(request), 0,
+                          (struct sockaddr*)&bcast_addr, sizeof(bcast_addr));
+    if (sent < 0) {
         perror("sendto");
         close(sockfd);
-        exit(EXIT_FAILURE);
+        return 1;
     }
 
-    /* On va maintenant écouter pendant un certain délai les réponses */
-    printf("neighborshow: requête envoyée (hops = %d). Attente des réponses...\n", hops);
+    // Pour éviter les doublons, on stocke dans un tableau (simple)
+    #define MAX_NEIGHBORS 1000
+    char neighbors[MAX_NEIGHBORS][256];
+    int neighbor_count = 0;
 
-    /* Pour stocker les noms reçus sans doublons, on peut utiliser un tableau,
-     * ou un set. Ici, par simplicité, on fera un petit tableau et on vérifie
-     * manuellement. */
-    #define MAX_HOSTS 100
-    char hosts[MAX_HOSTS][MAX_BUF];
-    int host_count = 0;
-
-    /* Début de l'intervalle d'écoute */
-    time_t start_time = time(NULL);
-
+    // Réception de réponses
     while (1) {
-        /* On calcule le temps écoulé */
-        time_t now = time(NULL);
-        if (difftime(now, start_time) > RESPONSE_WAIT_TIME) {
-            /* On arrête d'écouter après RESPONSE_WAIT_TIME secondes */
+        struct sockaddr_in sender_addr;
+        socklen_t sender_len = sizeof(sender_addr);
+        char buffer[BUFFER_SIZE];
+
+        ssize_t recvlen = recvfrom(sockfd, buffer, sizeof(buffer)-1, 0,
+                                   (struct sockaddr*)&sender_addr, &sender_len);
+        if (recvlen < 0) {
+            // Timeout ou erreur
             break;
         }
+        buffer[recvlen] = '\0';
 
-        /* On utilise select() pour attendre les données sans bloquer trop longtemps */
-        fd_set read_fds;
-        FD_ZERO(&read_fds);
-        FD_SET(sockfd, &read_fds);
-
-        struct timeval timeout;
-        timeout.tv_sec = 1;        // on vérifie toutes les 1 seconde
-        timeout.tv_usec = 0;
-
-        int retval = select(sockfd+1, &read_fds, NULL, NULL, &timeout);
-        if (retval < 0) {
-            perror("select");
-            break;
-        }
-        else if (retval == 0) {
-            /* Pas de données, on boucle pour voir si on dépasse RESPONSE_WAIT_TIME */
-            continue;
-        }
-        else {
-            /* Il y a potentiellement des données à lire */
-            if (FD_ISSET(sockfd, &read_fds)) {
-                char buf[MAX_BUF];
-                struct sockaddr_in src_addr;
-                socklen_t src_len = sizeof(src_addr);
-
-                memset(buf, 0, sizeof(buf));
-                int len = recvfrom(sockfd, buf, sizeof(buf), 0,
-                                   (struct sockaddr*)&src_addr, &src_len);
-                if (len > 0) {
-                    /* On a reçu une réponse (nom d’hôte) */
-                    // Vérifier si on l’a déjà
-                    bool found = false;
-                    for (int i = 0; i < host_count; i++) {
-                        if (strncmp(hosts[i], buf, MAX_BUF) == 0) {
-                            found = true;
-                            break;
-                        }
-                    }
-                    if (!found && host_count < MAX_HOSTS) {
-                        strncpy(hosts[host_count], buf, MAX_BUF-1);
-                        host_count++;
-                    }
-                }
+        // Le message reçu est censé être un hostname
+        // On vérifie simplement s'il est déjà connu
+        int known = 0;
+        for (int i = 0; i < neighbor_count; i++) {
+            if (strcmp(neighbors[i], buffer) == 0) {
+                known = 1;
+                break;
             }
+        }
+        if (!known && neighbor_count < MAX_NEIGHBORS) {
+            strncpy(neighbors[neighbor_count], buffer, sizeof(neighbors[neighbor_count]) - 1);
+            neighbors[neighbor_count][sizeof(neighbors[neighbor_count]) - 1] = '\0';
+            neighbor_count++;
         }
     }
 
     close(sockfd);
 
-    /* Affichage du résultat */
-    printf("neighborshow: liste des machines trouvées (hops=%d):\n", hops);
-    for (int i = 0; i < host_count; i++) {
-        printf(" - %s\n", hosts[i]);
+    // Affichage des résultats
+    printf("=== Neighbors trouvés (hop=%d) ===\n", hop);
+    if (neighbor_count == 0) {
+        printf("Aucun voisin détecté.\n");
+    } else {
+        for (int i = 0; i < neighbor_count; i++) {
+            printf("- %s\n", neighbors[i]);
+        }
     }
 
     return 0;
 }
-
