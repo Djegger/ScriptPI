@@ -1,179 +1,231 @@
-/****************************************************************************
- * neighboragent.c
+/****************************************************
+ * agent.c
  *
- * Agent réseau persistant, à exécuter sur chaque machine.
- * Il écoute sur un port UDP (par exemple 9999) et répond aux requêtes
- * de découverte en renvoyant le nom de la machine. Il relaie la requête
- * si le nombre de sauts (TTL / hop) n’est pas nul.
+ * Compilation :
+ *    gcc agent.c -o agent
  *
- * Compilation:
- *   gcc -o neighboragent neighboragent.c
+ * Exécution (exemple) :
+ *    sudo ./agent
  *
- * Exécution (en root ou avec les privilèges nécessaires si on utilise un port < 1024):
- *   ./neighboragent &
+ * Explications :
+ *  - Écoute UDP 9999
+ *  - À la réception d'un message du type :
+ *       "NEIGHBOR_DISCOVERY message_id=1234 hop=3 origin=machineA"
+ *    -> Répond avec le hostname
+ *    -> S'il hop>1, décrémente hop et envoie la requête vers la gateway.
  *
- ****************************************************************************/
+ ****************************************************/
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 #include <arpa/inet.h>
-#include <sys/socket.h>
 #include <netinet/in.h>
+#include <sys/types.h>
+#include <sys/socket.h>
 #include <netdb.h>
-#include <stdbool.h>
 #include <time.h>
+#include <ctype.h>
 
-/* Port UDP utilisé pour la découverte */
-#define DISCOVERY_PORT 9999
+#define AGENT_PORT 9999
+#define BUFFER_SIZE 1024
 
-/* On définit la taille de buffer max pour nos messages */
-#define MAX_BUF 1024
-
-/* Structure de la requête de découverte */
-typedef struct {
-    unsigned int request_id; // identifiant unique de la requête
-    int hops;                // nombre de sauts (TTL)
-} discovery_request_t;
-
-/* Pour éviter les re-transmissions infinies, on garde en mémoire
- * les requêtes déjà traitées récemment (via leur request_id).
- * Dans une version réelle, on peut utiliser une table de hachage
- * ou un cache. Ici, on fera au plus simple: un petit tableau. */
-#define CACHE_SIZE 100
+// Stockage basique des messages déjà vus (origin, message_id)
+#define MAX_SEEN 1000
 
 typedef struct {
-    unsigned int request_id;
-    time_t timestamp; // pour éventuellement expirer les vieilles requêtes
-} request_cache_entry_t;
+    char origin[64];
+    int  message_id;
+} seen_message_t;
 
-request_cache_entry_t cache[CACHE_SIZE];
+static seen_message_t seen_messages[MAX_SEEN];
+static int seen_count = 0;
 
-/* Ajoute un request_id au cache */
-void add_to_cache(unsigned int request_id) {
-    time_t now = time(NULL);
-    for (int i = 0; i < CACHE_SIZE; i++) {
-        if (cache[i].request_id == 0) {
-            cache[i].request_id = request_id;
-            cache[i].timestamp = now;
-            return;
-        }
+// Récupère le hostname local
+static void get_local_hostname(char *buf, size_t buflen) {
+    if (gethostname(buf, buflen) != 0) {
+        perror("gethostname");
+        strncpy(buf, "UnknownHost", buflen);
+        buf[buflen-1] = '\0';
     }
-    /* Si le cache est plein, on écrase le plus ancien (simple heuristique) */
-    int oldest_index = 0;
-    time_t oldest_time = cache[0].timestamp;
-    for (int i = 1; i < CACHE_SIZE; i++) {
-        if (cache[i].timestamp < oldest_time) {
-            oldest_time = cache[i].timestamp;
-            oldest_index = i;
-        }
-    }
-    cache[oldest_index].request_id = request_id;
-    cache[oldest_index].timestamp = now;
 }
 
-/* Vérifie si request_id est déjà dans le cache */
-bool is_in_cache(unsigned int request_id) {
-    time_t now = time(NULL);
-    for (int i = 0; i < CACHE_SIZE; i++) {
-        if (cache[i].request_id == request_id) {
-            /* Optionnel: on pourrait vérifier l'âge et supprimer si trop vieux */
-            return true;
+// Récupère la passerelle par défaut (IPv4) en la parsant dans "ip route show default"
+// => renvoie 1 si trouvé, 0 sinon
+static int get_default_gateway(char *gateway, size_t gwlen) {
+    FILE *fp = popen("ip route show default", "r");
+    if (!fp) {
+        perror("popen");
+        return 0;
+    }
+    char line[256];
+    memset(gateway, 0, gwlen);
+
+    while (fgets(line, sizeof(line), fp)) {
+        // Exemple: "default via 192.168.1.254 dev eth0 ..."
+        char *via = strstr(line, "via ");
+        if (via) {
+            via += 4; // skip "via "
+            sscanf(via, "%63s", gateway);
+            break;
         }
     }
-    return false;
+
+    pclose(fp);
+
+    if (strlen(gateway) > 0) {
+        return 1;
+    } else {
+        return 0;
+    }
 }
 
-int main() {
+// Vérifie si (origin, message_id) déjà vu
+static int has_already_seen(const char *origin, int msg_id) {
+    for (int i = 0; i < seen_count; i++) {
+        if ((seen_messages[i].message_id == msg_id) &&
+            (strcmp(seen_messages[i].origin, origin) == 0)) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+// Marque (origin, message_id) comme vu
+static void mark_as_seen(const char *origin, int msg_id) {
+    if (seen_count < MAX_SEEN) {
+        strncpy(seen_messages[seen_count].origin, origin, sizeof(seen_messages[seen_count].origin) - 1);
+        seen_messages[seen_count].origin[sizeof(seen_messages[seen_count].origin) - 1] = '\0';
+        seen_messages[seen_count].message_id = msg_id;
+        seen_count++;
+    }
+}
+
+// Fonction utilitaire pour envoyer la requête (message) en UDP à une IP donnée
+static void send_udp_message(const char *ip, unsigned short port,
+                             const char *message, size_t msg_len)
+{
     int sockfd;
-    struct sockaddr_in server_addr, client_addr;
-    socklen_t addr_len = sizeof(client_addr);
+    struct sockaddr_in addr;
 
-    /* Nettoyage du cache au démarrage */
-    memset(cache, 0, sizeof(cache));
-
-    /* Création d'un socket UDP */
     if ((sockfd = socket(AF_INET, SOCK_DGRAM, 0)) < 0) {
         perror("socket");
-        exit(EXIT_FAILURE);
+        return;
     }
 
-    /* Préparation de l'adresse serveur (agent) */
-    memset(&server_addr, 0, sizeof(server_addr));
-    server_addr.sin_family = AF_INET;
-    server_addr.sin_addr.s_addr = INADDR_ANY;  /* écoute sur toutes les interfaces */
-    server_addr.sin_port = htons(DISCOVERY_PORT);
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family      = AF_INET;
+    addr.sin_port        = htons(port);
+    addr.sin_addr.s_addr = inet_addr(ip);
 
-    /* On associe le socket à l'adresse et au port */
-    if (bind(sockfd, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
+    if (sendto(sockfd, message, msg_len, 0, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        perror("sendto");
+    }
+    close(sockfd);
+}
+
+int main(void) {
+    int sockfd;
+    struct sockaddr_in serv_addr, client_addr;
+    socklen_t addr_len = sizeof(client_addr);
+
+    // Récupération du hostname local
+    char hostname[256];
+    get_local_hostname(hostname, sizeof(hostname));
+
+    // Création du socket UDP
+    if ((sockfd = socket(AF_INET, SOCK_DGRAM, 0)) < 0) {
+        perror("socket");
+        return 1;
+    }
+
+    // Bind sur le port AGENT_PORT (9999)
+    memset(&serv_addr, 0, sizeof(serv_addr));
+    serv_addr.sin_family      = AF_INET;
+    serv_addr.sin_addr.s_addr = INADDR_ANY;
+    serv_addr.sin_port        = htons(AGENT_PORT);
+
+    if (bind(sockfd, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) < 0) {
         perror("bind");
         close(sockfd);
-        exit(EXIT_FAILURE);
+        return 1;
     }
 
-    printf("neighboragent: démarré, en écoute sur le port %d\n", DISCOVERY_PORT);
+    printf("[Agent] Démarré sur le port %d\n", AGENT_PORT);
+    printf("[Agent] Mon hostname = %s\n", hostname);
 
+    // Boucle principale de réception
     while (1) {
-        /* On reçoit un message (potentiellement une requête de découverte) */
-        discovery_request_t req;
-        memset(&req, 0, sizeof(req));
-
-        int recv_len = recvfrom(sockfd, &req, sizeof(req), 0,
-                                (struct sockaddr *)&client_addr, &addr_len);
-        if (recv_len < 0) {
+        char buffer[BUFFER_SIZE];
+        ssize_t recvlen = recvfrom(sockfd, buffer, BUFFER_SIZE - 1, 0,
+                                   (struct sockaddr *)&client_addr, &addr_len);
+        if (recvlen < 0) {
             perror("recvfrom");
-            continue;
+            break; // quitte la boucle en cas d'erreur
         }
 
-        /* Vérification basique : si c'est une requête valide */
-        if (recv_len == sizeof(discovery_request_t)) {
-            /* Vérifions si on a déjà traité cette requête (via son ID) */
-            if (!is_in_cache(req.request_id)) {
-                /* Si ce n'est pas dans le cache, on l'ajoute */
-                add_to_cache(req.request_id);
+        buffer[recvlen] = '\0';
 
-                /* On répond au client en lui envoyant notre hostname */
-                char hostname[128];
-                gethostname(hostname, sizeof(hostname));
+        // On s'attend à un message du type:
+        //    "NEIGHBOR_DISCOVERY message_id=1234 hop=3 origin=MachineA"
+        // On va parser ça très simplement
+        int msg_id = 0;
+        int hop    = 0;
+        char origin[64];
+        memset(origin, 0, sizeof(origin));
 
-                /* Envoi de la réponse */
-                sendto(sockfd, hostname, strlen(hostname) + 1, 0,
-                       (struct sockaddr *)&client_addr, addr_len);
+        if (strncmp(buffer, "NEIGHBOR_DISCOVERY", 18) == 0) {
+            // Extraire message_id, hop, origin
+            // Format naïf : "NEIGHBOR_DISCOVERY message_id=%d hop=%d origin=%s"
+            char dummy[32]; // pour "NEIGHBOR_DISCOVERY"
+            if (sscanf(buffer, "%s message_id=%d hop=%d origin=%63s",
+                       dummy, &msg_id, &hop, origin) == 4)
+            {
+                // Vérifier si on a déjà vu (origin, msg_id)
+                if (!has_already_seen(origin, msg_id)) {
+                    // Marquer comme vu
+                    mark_as_seen(origin, msg_id);
 
-                /* On relaie (broadcast) la requête si hops > 1 */
-                if (req.hops > 1) {
-                    req.hops--;
+                    // Répondre immédiatement au client -> on envoie "hostname"
+                    {
+                        ssize_t sent = sendto(sockfd,
+                                              hostname,
+                                              strlen(hostname),
+                                              0,
+                                              (struct sockaddr *)&client_addr,
+                                              addr_len);
+                        if (sent < 0) {
+                            perror("sendto response");
+                        }
+                    }
 
-                    /* Configuration d'adresse pour le broadcast */
-                    struct sockaddr_in broadcast_addr;
-                    memset(&broadcast_addr, 0, sizeof(broadcast_addr));
-                    broadcast_addr.sin_family = AF_INET;
-                    broadcast_addr.sin_port = htons(DISCOVERY_PORT);
-                    broadcast_addr.sin_addr.s_addr = htonl(INADDR_BROADCAST);
+                    // Si hop > 1, relayer vers la gateway (hop - 1)
+                    if (hop > 1) {
+                        // Récupère la GW
+                        char gateway[64];
+                        if (get_default_gateway(gateway, sizeof(gateway))) {
+                            // Construit le nouveau message
+                            char new_msg[BUFFER_SIZE];
+                            snprintf(new_msg, sizeof(new_msg),
+                                     "NEIGHBOR_DISCOVERY message_id=%d hop=%d origin=%s",
+                                     msg_id, hop - 1, origin);
 
-                    /* On doit activer l'option broadcast sur le socket */
-                    int broadcast_enable = 1;
-                    setsockopt(sockfd, SOL_SOCKET, SO_BROADCAST,
-                               &broadcast_enable, sizeof(broadcast_enable));
-
-                    /* On envoie la requête modifiée en broadcast */
-                    sendto(sockfd, &req, sizeof(req), 0,
-                           (struct sockaddr *)&broadcast_addr, sizeof(broadcast_addr));
-
-                    /* Optionnel: désactiver le broadcast à nouveau si besoin */
-                    broadcast_enable = 0;
-                    setsockopt(sockfd, SOL_SOCKET, SO_BROADCAST,
-                               &broadcast_enable, sizeof(broadcast_enable));
+                            // Envoie en unicast à la GW
+                            send_udp_message(gateway, AGENT_PORT,
+                                             new_msg, strlen(new_msg));
+                            // NOTE : Sur un routeur, on voudrait diffuser
+                            //        sur chaque interface (sauf celle d'où
+                            //        est venue la requête). Ici, on se limite
+                            //        à la gateway par défaut : BFS simple.
+                        }
+                    }
                 }
-            } 
-            else {
-                /* On ignore la requête car on l’a déjà traitée. */
+                // sinon -> déjà vu, on ne fait rien
             }
-        } 
-        else {
-            /* On peut ignorer ou logguer tout message mal formé. */
+            // sinon -> format invalide, on ignore
         }
+        // sinon -> message non reconnu, on ignore
     }
 
     close(sockfd);
